@@ -195,41 +195,91 @@ async function startActiveSession(sessionId) {
             bot_phone: activePhone,
           };
 
-          // 1. Relay to Live Server Bridge (Hostinger Standalone bridge.php & API)
+          // 1. Relay to Live Server Bridge & Local Backend
+          let webhookResult = null;
+
           try {
             // A. Standalone bridge.php
-            await fetch('https://api.lelbai.com/public/bridge.php?action=inbound-webhook', {
+            const bridgeRes = await fetch('https://api.lelbai.com/public/bridge.php?action=inbound-webhook', {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
                 'X-Bridge-Secret': BRIDGE_SECRET,
               },
               body: JSON.stringify(webhookPayload),
-            }).then(r => r.json()).then(j => {
-              if (j && j.verified) console.log(`✅ [Hostinger Bridge] User ${senderPhone} verified instantly!`);
-            }).catch(() => {});
-
-            // B. Live API Bridge
-            await fetch(`${LIVE_BRIDGE_URL}/inbound-webhook`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Bridge-Secret': BRIDGE_SECRET,
-              },
-              body: JSON.stringify(webhookPayload),
-            }).catch(() => {});
+            });
+            if (bridgeRes.ok) {
+              webhookResult = await bridgeRes.json();
+            }
           } catch (err) {
             console.error(`Bridge webhook error for ${senderPhone}:`, err.message);
           }
 
-          // 2. Also relay to Local Backend API if available
-          try {
-            await fetch(`${LOCAL_BACKEND_URL}/api/whatsapp/incoming`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(webhookPayload),
-            }).catch(() => {});
-          } catch (e) {}
+          // B. Live API Bridge Fallback
+          if (!webhookResult || (!webhookResult.verified && !webhookResult.mismatch)) {
+            try {
+              const apiBridgeRes = await fetch(`${LIVE_BRIDGE_URL}/inbound-webhook`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Bridge-Secret': BRIDGE_SECRET,
+                },
+                body: JSON.stringify(webhookPayload),
+              });
+              if (apiBridgeRes.ok) {
+                const apiData = await apiBridgeRes.json();
+                if (apiData && (apiData.verified || apiData.mismatch)) {
+                  webhookResult = apiData;
+                }
+              }
+            } catch (e) {}
+          }
+
+          // C. Local Backend API Fallback
+          if (!webhookResult || (!webhookResult.verified && !webhookResult.mismatch)) {
+            try {
+              const localRes = await fetch(`${LOCAL_BACKEND_URL}/api/whatsapp/incoming`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(webhookPayload),
+              });
+              if (localRes.ok) {
+                const locData = await localRes.json();
+                if (locData && (locData.verified || locData.mismatch)) {
+                  webhookResult = locData;
+                }
+              }
+            } catch (e) {}
+          }
+
+          // 2. 📱 Send direct WhatsApp Notification Message to user (إشعار خارج التطبيق على الواتساب مباشرة)
+          if (activeSock && remoteJid) {
+            try {
+              if (webhookResult && webhookResult.verified) {
+                const verifiedMsg = `✅ تم التحقق وتفعيل حسابك بنجاح في منصة للبيع (lelbai)!\n\n🎉 مرحباً بك، تم تسجيل دخولك بنجاح. يمكنك الآن متابعة تصفح المنصة واستخدام كافة الميزات وإضافة إعلاناتك بكل سهولة.`;
+                await activeSock.sendMessage(remoteJid, { text: verifiedMsg });
+                activeStats.sent++;
+                console.log(`📤 [WhatsApp Notification] Sent verified success reply to ${senderPhone}`);
+              } else if (webhookResult && webhookResult.mismatch) {
+                const expPhone = webhookResult.expected_phone || 'المسجل في الحساب';
+                const mismatchMsg = `⚠️ تنبيه من منصة للبيع (lelbai):\n\n❌ تم استلام كود التحقق ولكن رقم الواتساب الذي أرسلت منه (${senderPhone}) غير مطابق لرقم الحساب (${expPhone}).\n\n📌 يرجى إرسال الرسالة من نفس رقم الجوال المسجل في الحساب، أو التوجه للتطبيق وإنشاء حساب جديد برقمك الحالي.`;
+                await activeSock.sendMessage(remoteJid, { text: mismatchMsg });
+                activeStats.sent++;
+                console.log(`📤 [WhatsApp Notification] Sent mismatch warning reply to ${senderPhone}`);
+              } else {
+                // If message contains verification code / keywords but session was not found / expired
+                const isAuthIntent = /كود|الكود|code|التحقق|lelbai|للبيع/iu.test(text);
+                if (isAuthIntent) {
+                  const unmatchedMsg = `⚠️ مرحباً بك في منصة للبيع (lelbai).\n\nلم نتمكن من العثور على طلب تحقق نشط لهذا الرمز أو ربما انتهت صلاحية الجلسة (مدة الصلاحية 5 دقائق).\n\n📌 يرجى طلب كود تحقق جديد من التطبيق أو الموقع ثم إرساله مجدداً.`;
+                  await activeSock.sendMessage(remoteJid, { text: unmatchedMsg });
+                  activeStats.sent++;
+                  console.log(`📤 [WhatsApp Notification] Sent unmatched/expired reply to ${senderPhone}`);
+                }
+              }
+            } catch (sendReplyErr) {
+              console.error(`Failed to send WhatsApp reply to ${senderPhone}:`, sendReplyErr.message);
+            }
+          }
         }
       } catch (upsertErr) {
         console.error('Error handling upsert message:', upsertErr);
