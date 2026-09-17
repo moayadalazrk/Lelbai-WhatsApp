@@ -20,7 +20,9 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 5001;
-const BACKEND_WEBHOOK_URL = process.env.BACKEND_WEBHOOK_URL || 'https://aliceblue-goshawk-863641.hostingersite.com/backend/public/api/whatsapp/incoming';
+const LIVE_BRIDGE_URL = (process.env.LIVE_BRIDGE_URL || 'https://lelbai.com/api/bridge/whatsapp').replace(/\/+$/, '');
+const BRIDGE_SECRET = process.env.BRIDGE_SECRET || 'lelbai_bridge_secure_key_2026_9984';
+const LOCAL_BACKEND_URL = process.env.LOCAL_BACKEND_URL || 'http://127.0.0.1:8000';
 
 if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
@@ -153,7 +155,7 @@ async function startActiveSession(sessionId) {
       version,
       auth: state,
       printQRInTerminal: false,
-      browser: ['AZ Market WhatsApp', 'Chrome', '120.0.0'],
+      browser: ['Lelbai WhatsApp Gateway', 'Chrome', '122.0.0'],
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 0,
       keepAliveIntervalMs: 15000,
@@ -162,7 +164,7 @@ async function startActiveSession(sessionId) {
 
     activeSock.ev.on('creds.update', saveCreds);
 
-    // Inbound Messages Listener
+    // Inbound Messages Listener (Sends to Live Bridge & Local Backend)
     activeSock.ev.on('messages.upsert', async (m) => {
       try {
         const messages = m.messages || [];
@@ -184,21 +186,41 @@ async function startActiveSession(sessionId) {
           activeStats.received++;
           console.log(`📩 [Active Number ${activePhone || sessionId}] Received message from ${senderPhone}: "${text}"`);
 
+          const webhookPayload = {
+            sender_phone: senderPhone,
+            phone: senderPhone,
+            message_body: text,
+            message: text,
+            session_id: sessionId,
+            bot_phone: activePhone,
+          };
+
+          // 1. Relay to Live Server Bridge (Hostinger)
           try {
-            const response = await fetch(BACKEND_WEBHOOK_URL, {
+            const bridgeRes = await fetch(`${LIVE_BRIDGE_URL}/inbound-webhook`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Bridge-Secret': BRIDGE_SECRET,
+              },
+              body: JSON.stringify(webhookPayload),
+            });
+            const bridgeJson = await bridgeRes.json().catch(() => ({}));
+            if (bridgeJson.verified) {
+              console.log(`✅ [Bridge Success] User ${senderPhone} verified instantly on Live Server!`);
+            }
+          } catch (err) {
+            console.error(`Bridge webhook error for ${senderPhone}:`, err.message);
+          }
+
+          // 2. Also relay to Local Backend API if available
+          try {
+            await fetch(`${LOCAL_BACKEND_URL}/api/whatsapp/incoming`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                phone: senderPhone,
-                message: text,
-                session_id: sessionId,
-                bot_phone: activePhone,
-              }),
-            });
-            await response.json().catch(() => ({}));
-          } catch (err) {
-            console.error(`Error sending webhook for ${senderPhone}:`, err.message);
-          }
+              body: JSON.stringify(webhookPayload),
+            }).catch(() => {});
+          } catch (e) {}
         }
       } catch (upsertErr) {
         console.error('Error handling upsert message:', upsertErr);
@@ -230,6 +252,7 @@ async function startActiveSession(sessionId) {
         sessionMeta.set(sessionId, meta);
 
         console.log(`✅ [Active Number] Connected successfully: +${activePhone} (${sessionId})`);
+        syncHeartbeatToBridge();
       }
 
       if (connection === 'close') {
@@ -248,6 +271,8 @@ async function startActiveSession(sessionId) {
           activePhone = null;
         }
 
+        syncHeartbeatToBridge();
+
         // Automatic Failover: If active number failed/disconnected, switch to next standby session
         handleFailoverToNextSession(sessionId, isLoggedOut);
       }
@@ -257,6 +282,7 @@ async function startActiveSession(sessionId) {
     console.error(`Failed to start session ${sessionId}:`, err);
     activeStatus = 'disconnected';
     activeLastError = err.message;
+    syncHeartbeatToBridge();
     handleFailoverToNextSession(sessionId, false);
   }
 }
@@ -281,6 +307,80 @@ function handleFailoverToNextSession(failedSessionId, isLoggedOut) {
     }, 3000);
   }
 }
+
+// 🚀 1. Send Heartbeat to Live Bridge every 20 seconds
+async function syncHeartbeatToBridge() {
+  try {
+    const allSessions = Array.from(sessionMeta.values()).map(s => ({
+      id: s.id,
+      name: s.name,
+      phone: s.id === currentActiveId ? activePhone : s.phone,
+      is_active: s.id === currentActiveId,
+      status: s.id === currentActiveId ? activeStatus : 'standby',
+    }));
+
+    await fetch(`${LIVE_BRIDGE_URL}/heartbeat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Bridge-Secret': BRIDGE_SECRET,
+      },
+      body: JSON.stringify({
+        status: activeStatus,
+        phone: activePhone,
+        sessions: allSessions,
+        uptime: process.uptime(),
+      }),
+    }).catch(() => {});
+  } catch (err) {}
+}
+
+// 🚀 2. Poll Pending Outbox Queue from Live Bridge every 3.5 seconds and dispatch OTPs
+async function pollAndDispatchBridgeQueue() {
+  if (activeStatus !== 'connected' || !activeSock) return;
+
+  try {
+    const res = await fetch(`${LIVE_BRIDGE_URL}/pending-queue`, {
+      headers: {
+        'X-Bridge-Secret': BRIDGE_SECRET,
+      },
+    });
+    if (!res.ok) return;
+
+    const data = await res.json();
+    const outbox = data.outbox_queue || [];
+
+    for (const item of outbox) {
+      const formatted = formatWhatsAppPhone(item.phone);
+      if (!formatted) continue;
+
+      const targetJid = `${formatted}@s.whatsapp.net`;
+      const messageText = `${item.code} هو رمز تاكيد حسابك على منصة للبيع`;
+
+      try {
+        await activeSock.sendMessage(targetJid, { text: messageText });
+        activeStats.sent++;
+        console.log(`🚀 [Bridge Dispatch] Sent OTP code ${item.code} to ${formatted}`);
+
+        // Mark sent
+        await fetch(`${LIVE_BRIDGE_URL}/mark-sent`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Bridge-Secret': BRIDGE_SECRET,
+          },
+          body: JSON.stringify({ id: item.id }),
+        }).catch(() => {});
+      } catch (sendErr) {
+        console.error(`Failed to dispatch OTP to ${formatted}:`, sendErr.message);
+      }
+    }
+  } catch (err) {}
+}
+
+// Start polling & heartbeat intervals
+setInterval(syncHeartbeatToBridge, 20000);
+setInterval(pollAndDispatchBridgeQueue, 3500);
 
 // Start primary session on launch
 startActiveSession(currentActiveId);
@@ -476,6 +576,132 @@ app.post('/send-otp', async (req, res) => {
   }
 });
 
+// Web UI: Dashboard with Live QR Code & Session Monitor
+app.get('/', (req, res) => {
+  const isConnected = activeStatus === 'connected';
+  const isQrReady = activeStatus === 'qr_ready' && activeQr;
+
+  const html = `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>خادم واتساب منصة للبيع | WhatsApp Gateway</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    .card {
+      background: #1e293b;
+      border-radius: 16px;
+      padding: 32px;
+      width: 100%;
+      max-width: 480px;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+      text-align: center;
+      border: 1px solid #334155;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 20px;
+    }
+    .badge-connected { background: #064e3b; color: #34d399; }
+    .badge-qr { background: #78350f; color: #fbbf24; }
+    .badge-disconnected { background: #7f1d1d; color: #f87171; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+    h1 { font-size: 20px; margin: 0 0 8px 0; color: #f8fafc; }
+    p { color: #94a3b8; font-size: 14px; margin: 0 0 24px 0; }
+    .qr-container {
+      background: #ffffff;
+      padding: 16px;
+      border-radius: 12px;
+      display: inline-block;
+      margin-bottom: 20px;
+    }
+    .qr-container img { display: block; width: 220px; height: 220px; }
+    .info-box {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 14px;
+      font-size: 13px;
+      color: #cbd5e1;
+      text-align: right;
+      margin-bottom: 20px;
+    }
+    .info-row { display: flex; justify-content: space-between; padding: 4px 0; }
+    .info-label { color: #64748b; }
+    .btn {
+      background: #2563eb;
+      color: #ffffff;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .btn:hover { background: #1d4ed8; }
+  </style>
+  <script>
+    setTimeout(() => {
+      window.location.reload();
+    }, 6000);
+  </script>
+</head>
+<body>
+  <div class="card">
+    <div class="badge ${isConnected ? 'badge-connected' : isQrReady ? 'badge-qr' : 'badge-disconnected'}">
+      <span class="dot"></span>
+      ${isConnected ? 'متصل وجاهز للعمل' : isQrReady ? 'بانتظار مسح رمز QR' : 'جاري تهيئة الاتصال...'}
+    </div>
+    
+    <h1>بوابة واتساب منصة للبيع</h1>
+    <p>امسح الرمز من تطبيق واتساب لربط رقم الهاتف تلقائياً</p>
+
+    ${isQrReady ? `
+      <div class="qr-container">
+        <img src="${activeQr}" alt="QR Code" />
+      </div>
+      <p style="font-size: 12px; color: #64748b; margin-top: -10px;">يتجدد الرمز تلقائياً كل 6 ثوانٍ</p>
+    ` : isConnected ? `
+      <div style="font-size: 48px; margin-bottom: 16px;">✅</div>
+      <p style="color: #34d399; font-weight: bold; font-size: 16px;">الرقم المتصل: +${activePhone}</p>
+    ` : `
+      <div style="padding: 40px; color: #94a3b8;">جاري توليد رمز QR... يرجى الانتظار</div>
+    `}
+
+    <div class="info-box">
+      <div class="info-row"><span class="info-label">حالة السيرفر:</span><span>${activeStatus}</span></div>
+      <div class="info-row"><span class="info-label">الرقم النشط:</span><span>${activePhone ? '+' + activePhone : 'غير متصل'}</span></div>
+      <div class="info-row"><span class="info-label">الجلسة:</span><span>${currentActiveId}</span></div>
+      <div class="info-row"><span class="info-label">رابط الجسر الحي:</span><span>${LIVE_BRIDGE_URL}</span></div>
+    </div>
+
+    <button onclick="window.location.reload()" class="btn">🔄 تحديث الحالة</button>
+  </div>
+</body>
+</html>`;
+  return res.send(html);
+});
+
 // API 9: Health check
 app.get('/health', (req, res) => {
   return res.json({
@@ -490,4 +716,5 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 WhatsApp Active-Standby Gateway running on port ${PORT}`);
+  console.log(`🔗 Connected with Live Bridge: ${LIVE_BRIDGE_URL}`);
 });
