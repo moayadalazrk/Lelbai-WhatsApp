@@ -195,20 +195,29 @@ async function startActiveSession(sessionId) {
             bot_phone: activePhone,
           };
 
-          // 1. Relay to Live Server Bridge (Hostinger)
+          // 1. Relay to Live Server Bridge (Hostinger Standalone bridge.php & API)
           try {
-            const bridgeRes = await fetch(`${LIVE_BRIDGE_URL}/inbound-webhook`, {
+            // A. Standalone bridge.php
+            await fetch('https://api.lelbai.com/public/bridge.php?action=inbound-webhook', {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
                 'X-Bridge-Secret': BRIDGE_SECRET,
               },
               body: JSON.stringify(webhookPayload),
-            });
-            const bridgeJson = await bridgeRes.json().catch(() => ({}));
-            if (bridgeJson.verified) {
-              console.log(`✅ [Bridge Success] User ${senderPhone} verified instantly on Live Server!`);
-            }
+            }).then(r => r.json()).then(j => {
+              if (j && j.verified) console.log(`✅ [Hostinger Bridge] User ${senderPhone} verified instantly!`);
+            }).catch(() => {});
+
+            // B. Live API Bridge
+            await fetch(`${LIVE_BRIDGE_URL}/inbound-webhook`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Bridge-Secret': BRIDGE_SECRET,
+              },
+              body: JSON.stringify(webhookPayload),
+            }).catch(() => {});
           } catch (err) {
             console.error(`Bridge webhook error for ${senderPhone}:`, err.message);
           }
