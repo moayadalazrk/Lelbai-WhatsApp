@@ -267,14 +267,11 @@ async function startActiveSession(sessionId) {
                 activeStats.sent++;
                 console.log(`📤 [WhatsApp Notification] Sent mismatch warning reply to ${senderPhone}`);
               } else {
-                // If message contains verification code / keywords but session was not found / expired
-                const isAuthIntent = /كود|الكود|code|التحقق|lelbai|للبيع/iu.test(text);
-                if (isAuthIntent) {
-                  const unmatchedMsg = `⚠️ مرحباً بك في منصة للبيع (lelbai).\n\nلم نتمكن من العثور على طلب تحقق نشط لهذا الرمز أو ربما انتهت صلاحية الجلسة (مدة الصلاحية 5 دقائق).\n\n📌 يرجى طلب كود تحقق جديد من التطبيق أو الموقع ثم إرساله مجدداً.`;
-                  await activeSock.sendMessage(remoteJid, { text: unmatchedMsg });
-                  activeStats.sent++;
-                  console.log(`📤 [WhatsApp Notification] Sent unmatched/expired reply to ${senderPhone}`);
-                }
+                // Invalid code, expired, or general inquiry
+                const unmatchedMsg = `❌ تنبيه من منصة للبيع (lelbai):\n\nكود التحقق الذي أرسلته غير صحيح أو انتهت صلاحيته (مدة الصلاحية 15 دقيقة).\n\n📌 يرجى فتح التطبيق أو الموقع، وطلب كود جديد ثم إرساله مجدداً من نفس رقمك المسجل.`;
+                await activeSock.sendMessage(remoteJid, { text: unmatchedMsg });
+                activeStats.sent++;
+                console.log(`📤 [WhatsApp Notification] Sent invalid/expired reply to ${senderPhone}`);
               }
             } catch (sendReplyErr) {
               console.error(`Failed to send WhatsApp reply to ${senderPhone}:`, sendReplyErr.message);
