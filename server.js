@@ -9,6 +9,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  Browsers,
 } from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -187,11 +188,14 @@ async function startActiveSession(sessionId) {
     activeSock = makeWASocket({
       version,
       auth: state,
-      printQRInTerminal: false,
-      browser: ['Lelbai WhatsApp Gateway', 'Chrome', '122.0.0'],
-      connectTimeoutMs: 60000,
+      printQRInTerminal: true,
+      browser: Browsers.ubuntu('Chrome'),
+      connectTimeoutMs: 90000,
       defaultQueryTimeoutMs: 0,
-      keepAliveIntervalMs: 15000,
+      keepAliveIntervalMs: 25000,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false,
+      markOnlineOnConnect: true,
       logger: pino({ level: 'silent' }),
     });
 
@@ -271,6 +275,7 @@ async function startActiveSession(sessionId) {
         try {
           activeQr = await QRCode.toDataURL(qr);
           activeStatus = 'qr_ready';
+          console.log(`📱 [QR Ready] Session ${sessionId} QR code ready for scanning.`);
           syncHeartbeatToBridge();
         } catch (err) {
           console.error('Error generating QR code:', err);
@@ -295,43 +300,40 @@ async function startActiveSession(sessionId) {
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        activeStatus = 'disconnected';
-        activeQr = null;
         console.log(`❌ [Active Number] Disconnected (Code: ${statusCode}, LoggedOut: ${isLoggedOut})`);
 
         if (isLoggedOut) {
+          activeStatus = 'disconnected';
+          activeQr = null;
+          activePhone = null;
           try {
             if (fs.existsSync(sessionFolder)) {
               fs.rmSync(sessionFolder, { recursive: true, force: true });
             }
           } catch (e) {}
-          activePhone = null;
           const meta = sessionMeta.get(sessionId);
           if (meta) {
             meta.phone = null;
             sessionMeta.set(sessionId, meta);
           }
-        }
+          syncHeartbeatToBridge();
 
-        syncHeartbeatToBridge();
-
-        // Automatic Failover:
-        if (!isLoggedOut) {
-          handleFailoverToNextSession(sessionId, false);
+          setTimeout(() => {
+            startActiveSession(sessionId);
+          }, 3000);
         } else {
-          // If logged out on phone, check if there is another standby session
-          const allIds = Array.from(sessionMeta.keys());
-          const otherIds = allIds.filter(id => id !== sessionId);
-          if (otherIds.length > 0) {
-            console.log(`⚡ [Logged Out] Session ${sessionId} logged out on device. Switching to standby: ${otherIds[0]}`);
-            setTimeout(() => {
-              startActiveSession(otherIds[0]);
-            }, 2000);
+          // Reconnecting gracefully
+          if (activeStatus === 'connected') {
+            activeStatus = 'connecting';
+            syncHeartbeatToBridge();
+            handleFailoverToNextSession(sessionId, false);
           } else {
-            console.log(`ℹ️ [Logged Out] Session ${sessionId} logged out on device. Clean state ready.`);
+            // Still in QR pairing phase -> keep QR stable in UI
+            activeStatus = activeQr ? 'qr_ready' : 'connecting';
+            syncHeartbeatToBridge();
             setTimeout(() => {
               startActiveSession(sessionId);
-            }, 2000);
+            }, 3000);
           }
         }
       }
@@ -342,7 +344,9 @@ async function startActiveSession(sessionId) {
     activeStatus = 'disconnected';
     activeLastError = err.message;
     syncHeartbeatToBridge();
-    handleFailoverToNextSession(sessionId, false);
+    setTimeout(() => {
+      startActiveSession(sessionId);
+    }, 4000);
   }
 }
 
