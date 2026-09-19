@@ -271,6 +271,7 @@ async function startActiveSession(sessionId) {
         try {
           activeQr = await QRCode.toDataURL(qr);
           activeStatus = 'qr_ready';
+          syncHeartbeatToBridge();
         } catch (err) {
           console.error('Error generating QR code:', err);
         }
