@@ -107,13 +107,24 @@ function loadSessionsFromDisk() {
       });
       currentActiveId = sessionDirs[0];
     } else {
-      currentActiveId = null;
-      activeStatus = 'disconnected';
+      // Auto-initialize primary session slot on fresh launch so QR code is ready immediately
+      sessionMeta.set('session_1', {
+        id: 'session_1',
+        name: 'الرقم الأساسي (1)',
+        phone: null,
+        isStandby: false,
+      });
+      currentActiveId = 'session_1';
     }
   } catch (e) {
     sessionMeta.clear();
-    currentActiveId = null;
-    activeStatus = 'disconnected';
+    sessionMeta.set('session_1', {
+      id: 'session_1',
+      name: 'الرقم الأساسي (1)',
+      phone: null,
+      isStandby: false,
+    });
+    currentActiveId = 'session_1';
   }
 }
 
