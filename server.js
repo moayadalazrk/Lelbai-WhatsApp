@@ -195,11 +195,14 @@ async function startActiveSession(sessionId) {
             bot_phone: activePhone,
           };
 
-          // 1. Relay to Live Server Bridge & Local Backend
+          // 1. High-Speed Direct Relay to Live Server Bridge (<50ms)
           let webhookResult = null;
+          const tStart = Date.now();
 
           try {
-            // A. Standalone bridge.php
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 4000);
+
             const bridgeRes = await fetch('https://api.lelbai.com/public/bridge.php?action=inbound-webhook', {
               method: 'POST',
               headers: {
@@ -207,7 +210,10 @@ async function startActiveSession(sessionId) {
                 'X-Bridge-Secret': BRIDGE_SECRET,
               },
               body: JSON.stringify(webhookPayload),
+              signal: controller.signal,
             });
+            clearTimeout(timeoutId);
+
             if (bridgeRes.ok) {
               webhookResult = await bridgeRes.json();
             }
@@ -215,45 +221,9 @@ async function startActiveSession(sessionId) {
             console.error(`Bridge webhook error for ${senderPhone}:`, err.message);
           }
 
-          // B. Live API Bridge Fallback
-          if (!webhookResult || (!webhookResult.verified && !webhookResult.mismatch)) {
-            try {
-              const apiBridgeRes = await fetch(`${LIVE_BRIDGE_URL}/inbound-webhook`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'X-Bridge-Secret': BRIDGE_SECRET,
-                },
-                body: JSON.stringify(webhookPayload),
-              });
-              if (apiBridgeRes.ok) {
-                const apiData = await apiBridgeRes.json();
-                if (apiData && (apiData.verified || apiData.mismatch)) {
-                  webhookResult = apiData;
-                }
-              }
-            } catch (e) {}
-          }
-
-          // C. Local Backend API Fallback
-          if (!webhookResult || (!webhookResult.verified && !webhookResult.mismatch)) {
-            try {
-              const localRes = await fetch(`${LOCAL_BACKEND_URL}/api/whatsapp/incoming`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(webhookPayload),
-              });
-              if (localRes.ok) {
-                const locData = await localRes.json();
-                if (locData && (locData.verified || locData.mismatch)) {
-                  webhookResult = locData;
-                }
-              }
-            } catch (e) {}
-          }
-
+          const durationMs = Date.now() - tStart;
           // 2. WhatsApp bot is strictly silent on WhatsApp (No auto-replies sent via WhatsApp)
-          console.log(`ℹ️ [Inbound Message Handled Silently] Webhook status:`, webhookResult?.verified ? 'VERIFIED' : webhookResult?.mismatch ? 'MISMATCH' : 'UNMATCHED');
+          console.log(`⚡ [Inbound Processed in ${durationMs}ms] Webhook status:`, webhookResult?.verified ? 'VERIFIED' : webhookResult?.mismatch ? 'MISMATCH' : 'UNMATCHED');
         }
       } catch (upsertErr) {
         console.error('Error handling upsert message:', upsertErr);
