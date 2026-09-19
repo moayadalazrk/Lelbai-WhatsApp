@@ -252,31 +252,8 @@ async function startActiveSession(sessionId) {
             } catch (e) {}
           }
 
-          // 2. 📱 Send direct WhatsApp Notification Message to user (إشعار خارج التطبيق على الواتساب مباشرة)
-          if (activeSock && remoteJid) {
-            try {
-              if (webhookResult && webhookResult.verified) {
-                const verifiedMsg = `✅ تم التحقق وتفعيل حسابك بنجاح في منصة للبيع (lelbai)!\n\n🎉 مرحباً بك، تم تسجيل دخولك بنجاح. يمكنك الآن متابعة تصفح المنصة واستخدام كافة الميزات وإضافة إعلاناتك بكل سهولة.`;
-                await activeSock.sendMessage(remoteJid, { text: verifiedMsg });
-                activeStats.sent++;
-                console.log(`📤 [WhatsApp Notification] Sent verified success reply to ${senderPhone}`);
-              } else if (webhookResult && webhookResult.mismatch) {
-                const expPhone = webhookResult.expected_phone || 'المسجل في الحساب';
-                const mismatchMsg = `⚠️ تنبيه من منصة للبيع (lelbai):\n\n❌ تم استلام كود التحقق ولكن رقم الواتساب الذي أرسلت منه (${senderPhone}) غير مطابق لرقم الحساب (${expPhone}).\n\n📌 يرجى إرسال الرسالة من نفس رقم الجوال المسجل في الحساب، أو التوجه للتطبيق وإنشاء حساب جديد برقمك الحالي.`;
-                await activeSock.sendMessage(remoteJid, { text: mismatchMsg });
-                activeStats.sent++;
-                console.log(`📤 [WhatsApp Notification] Sent mismatch warning reply to ${senderPhone}`);
-              } else {
-                // Invalid code, expired, or general inquiry
-                const unmatchedMsg = `❌ تنبيه من منصة للبيع (lelbai):\n\nكود التحقق الذي أرسلته غير صحيح أو انتهت صلاحيته (مدة الصلاحية 15 دقيقة).\n\n📌 يرجى فتح التطبيق أو الموقع، وطلب كود جديد ثم إرساله مجدداً من نفس رقمك المسجل.`;
-                await activeSock.sendMessage(remoteJid, { text: unmatchedMsg });
-                activeStats.sent++;
-                console.log(`📤 [WhatsApp Notification] Sent invalid/expired reply to ${senderPhone}`);
-              }
-            } catch (sendReplyErr) {
-              console.error(`Failed to send WhatsApp reply to ${senderPhone}:`, sendReplyErr.message);
-            }
-          }
+          // 2. WhatsApp bot is strictly silent on WhatsApp (No auto-replies sent via WhatsApp)
+          console.log(`ℹ️ [Inbound Message Handled Silently] Webhook status:`, webhookResult?.verified ? 'VERIFIED' : webhookResult?.mismatch ? 'MISMATCH' : 'UNMATCHED');
         }
       } catch (upsertErr) {
         console.error('Error handling upsert message:', upsertErr);
