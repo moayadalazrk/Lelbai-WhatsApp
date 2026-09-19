@@ -10,6 +10,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
+  makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -21,7 +22,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 5001;
-const LIVE_BRIDGE_URL = (process.env.LIVE_BRIDGE_URL || 'https://lelbai.com/api/bridge/whatsapp').replace(/\/+$/, '');
+const LIVE_BRIDGE_URL = (process.env.LIVE_BRIDGE_URL || 'https://api.lelbai.com/public/bridge.php').replace(/\/+$/, '');
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET || 'lelbai_bridge_secure_key_2026_9984';
 const LOCAL_BACKEND_URL = process.env.LOCAL_BACKEND_URL || 'http://127.0.0.1:8000';
 
@@ -29,17 +30,19 @@ if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
-// Session metadata state
-const sessionMeta = new Map(); // id -> { id, name, phone, isStandby }
+// Session metadata state: id -> { id, name, phone, isStandby }
+const sessionMeta = new Map();
 
-// Currently active running session
+// Currently active running session state
 let currentActiveId = 'session_1';
 let activeSock = null;
 let activeStatus = 'disconnected'; // 'disconnected' | 'connecting' | 'qr_ready' | 'connected'
 let activePhone = null;
 let activeQr = null;
+let activePairingCode = null;
 let activeLastError = null;
 let activeStats = { received: 0, sent: 0, connectedAt: null };
+let isStartingSession = false;
 
 function extractMessageContent(msg) {
   if (!msg || !msg.message) return '';
@@ -108,7 +111,6 @@ function loadSessionsFromDisk() {
       });
       currentActiveId = sessionDirs[0];
     } else {
-      // Auto-initialize primary session slot on fresh launch so QR code is ready immediately
       sessionMeta.set('session_1', {
         id: 'session_1',
         name: 'الرقم الأساسي (1)',
@@ -134,8 +136,37 @@ loadSessionsFromDisk();
 /**
  * Start monitoring and running ONLY the single active session
  */
-async function startActiveSession(sessionId) {
-  if (!sessionId) {
+async function startActiveSession(sessionId, preserveQr = true) {
+  if (isStartingSession) return;
+  isStartingSession = true;
+
+  try {
+    if (!sessionId) {
+      if (activeSock) {
+        try {
+          activeSock.ev.removeAllListeners('connection.update');
+          activeSock.ev.removeAllListeners('creds.update');
+          activeSock.ev.removeAllListeners('messages.upsert');
+          activeSock.end();
+        } catch (e) {}
+        activeSock = null;
+      }
+      currentActiveId = null;
+      activeStatus = 'disconnected';
+      activePhone = null;
+      activeQr = null;
+      activePairingCode = null;
+      isStartingSession = false;
+      return;
+    }
+
+    currentActiveId = sessionId;
+    const sessionFolder = path.join(SESSIONS_DIR, sessionId);
+    if (!fs.existsSync(sessionFolder)) {
+      fs.mkdirSync(sessionFolder, { recursive: true });
+    }
+
+    // Close previous socket if open
     if (activeSock) {
       try {
         activeSock.ev.removeAllListeners('connection.update');
@@ -145,63 +176,47 @@ async function startActiveSession(sessionId) {
       } catch (e) {}
       activeSock = null;
     }
-    currentActiveId = null;
-    activeStatus = 'disconnected';
-    activePhone = null;
-    activeQr = null;
-    return;
-  }
 
-  currentActiveId = sessionId;
-  const sessionFolder = path.join(SESSIONS_DIR, sessionId);
-  if (!fs.existsSync(sessionFolder)) {
-    fs.mkdirSync(sessionFolder, { recursive: true });
-  }
+    if (!preserveQr) {
+      activeQr = null;
+    }
+    activeStatus = activeQr ? 'qr_ready' : 'connecting';
+    activeLastError = null;
 
-  // Close previous socket if any
-  if (activeSock) {
-    try {
-      activeSock.ev.removeAllListeners('connection.update');
-      activeSock.ev.removeAllListeners('creds.update');
-      activeSock.ev.removeAllListeners('messages.upsert');
-      activeSock.end();
-    } catch (e) {}
-    activeSock = null;
-  }
+    console.log(`🔌 [Active Monitor] Initializing session: ${sessionId} (PreserveQR: ${preserveQr && !!activeQr})`);
 
-  activeStatus = 'connecting';
-  activeQr = null;
-  activeLastError = null;
-
-  console.log(`🔌 [Active Monitor] Starting and monitoring ONLY active session: ${sessionId}`);
-
-  try {
     const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-    
-    // Fast Baileys version with fallback
-    let version = [2, 3000, 1015901307];
+
+    // Latest version detection with solid modern fallback
+    let version = [2, 3000, 1043857760];
     try {
       const v = await fetchLatestBaileysVersion().catch(() => null);
       if (v?.version) version = v.version;
     } catch (e) {}
 
+    const logger = pino({ level: 'silent' });
+
     activeSock = makeWASocket({
       version,
-      auth: state,
-      printQRInTerminal: true,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      printQRInTerminal: false,
       browser: Browsers.ubuntu('Chrome'),
-      connectTimeoutMs: 90000,
+      connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 0,
       keepAliveIntervalMs: 25000,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
       markOnlineOnConnect: true,
-      logger: pino({ level: 'silent' }),
+      logger,
+      retryRequestDelayMs: 250,
     });
 
     activeSock.ev.on('creds.update', saveCreds);
 
-    // Inbound Messages Listener (Sends to Live Bridge & Local Backend)
+    // Inbound Messages Listener
     activeSock.ev.on('messages.upsert', async (m) => {
       try {
         const messages = m.messages || [];
@@ -221,7 +236,7 @@ async function startActiveSession(sessionId) {
           if (!text.trim()) continue;
 
           activeStats.received++;
-          console.log(`📩 [Active Number ${activePhone || sessionId}] Received message from ${senderPhone}: "${text}"`);
+          console.log(`📩 [Active Number ${activePhone || sessionId}] Inbound message from ${senderPhone}: "${text}"`);
 
           const webhookPayload = {
             sender_phone: senderPhone,
@@ -232,7 +247,7 @@ async function startActiveSession(sessionId) {
             bot_phone: activePhone,
           };
 
-          // 1. High-Speed Direct Relay to Live Server Bridge (<50ms)
+          // Fast direct relay to Bridge on Hostinger
           let webhookResult = null;
           const tStart = Date.now();
 
@@ -259,8 +274,7 @@ async function startActiveSession(sessionId) {
           }
 
           const durationMs = Date.now() - tStart;
-          // 2. WhatsApp bot is strictly silent on WhatsApp (No auto-replies sent via WhatsApp)
-          console.log(`⚡ [Inbound Processed in ${durationMs}ms] Webhook status:`, webhookResult?.verified ? 'VERIFIED' : webhookResult?.mismatch ? 'MISMATCH' : 'UNMATCHED');
+          console.log(`⚡ [Inbound Webhook in ${durationMs}ms] Verification status:`, webhookResult?.verified ? 'VERIFIED ✅' : 'RECORDED 📝');
         }
       } catch (upsertErr) {
         console.error('Error handling upsert message:', upsertErr);
@@ -275,7 +289,7 @@ async function startActiveSession(sessionId) {
         try {
           activeQr = await QRCode.toDataURL(qr);
           activeStatus = 'qr_ready';
-          console.log(`📱 [QR Ready] Session ${sessionId} QR code ready for scanning.`);
+          console.log(`📱 [QR Code Ready] Session ${sessionId} QR code ready for scanning.`);
           syncHeartbeatToBridge();
         } catch (err) {
           console.error('Error generating QR code:', err);
@@ -285,26 +299,30 @@ async function startActiveSession(sessionId) {
       if (connection === 'open') {
         activeStatus = 'connected';
         activeQr = null;
+        activePairingCode = null;
         activeStats.connectedAt = new Date();
         const userJid = activeSock?.user?.id || '';
-        activePhone = userJid.split(':')[0] || userJid.split('@')[0] || 'متصل';
+        activePhone = userJid.split(':')[0]?.split('@')[0]?.replace(/\D/g, '') || 'متصل';
         
         const meta = sessionMeta.get(sessionId) || { id: sessionId };
         meta.phone = activePhone;
         sessionMeta.set(sessionId, meta);
 
-        console.log(`✅ [Active Number] Connected successfully: +${activePhone} (${sessionId})`);
+        console.log(`✅ [Active WhatsApp Number] Connected successfully: +${activePhone} (${sessionId})`);
         syncHeartbeatToBridge();
       }
 
       if (connection === 'close') {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        console.log(`❌ [Active Number] Disconnected (Code: ${statusCode}, LoggedOut: ${isLoggedOut})`);
+        const isRestartReq = statusCode === DisconnectReason.restartRequired;
+
+        console.log(`❌ [Active WhatsApp Connection Closed] Code: ${statusCode} (LoggedOut: ${isLoggedOut}, RestartRequired: ${isRestartReq})`);
 
         if (isLoggedOut) {
           activeStatus = 'disconnected';
           activeQr = null;
+          activePairingCode = null;
           activePhone = null;
           try {
             if (fs.existsSync(sessionFolder)) {
@@ -319,20 +337,26 @@ async function startActiveSession(sessionId) {
           syncHeartbeatToBridge();
 
           setTimeout(() => {
-            startActiveSession(sessionId);
-          }, 3000);
+            if (currentActiveId === sessionId) {
+              startActiveSession(sessionId, false);
+            }
+          }, 2000);
+        } else if (isRestartReq) {
+          // Restart immediately (Handshake completed by mobile QR scan)
+          console.log(`🔄 [QR Handshake Finalizing] Restart required (515) - Reconnecting immediately...`);
+          startActiveSession(sessionId, true);
         } else {
-          // Reconnecting gracefully
+          // Normal background reconnect / refresh
           if (activeStatus === 'connected') {
             activeStatus = 'connecting';
             syncHeartbeatToBridge();
             handleFailoverToNextSession(sessionId, false);
           } else {
-            // Still in QR pairing phase -> keep QR stable in UI
-            activeStatus = activeQr ? 'qr_ready' : 'connecting';
-            syncHeartbeatToBridge();
+            // Keep QR in UI and reconnect smoothly
             setTimeout(() => {
-              startActiveSession(sessionId);
+              if (currentActiveId === sessionId && activeStatus !== 'connected') {
+                startActiveSession(sessionId, true);
+              }
             }, 3000);
           }
         }
@@ -345,8 +369,12 @@ async function startActiveSession(sessionId) {
     activeLastError = err.message;
     syncHeartbeatToBridge();
     setTimeout(() => {
-      startActiveSession(sessionId);
+      if (currentActiveId === sessionId) {
+        startActiveSession(sessionId, false);
+      }
     }, 4000);
+  } finally {
+    isStartingSession = false;
   }
 }
 
@@ -359,19 +387,18 @@ function handleFailoverToNextSession(failedSessionId, isLoggedOut) {
 
   if (otherIds.length > 0) {
     const nextSessionId = otherIds[0];
-    console.log(`⚡ [Failover] Active session ${failedSessionId} disconnected! Switching automatically to standby: ${nextSessionId}`);
+    console.log(`⚡ [Failover] Session ${failedSessionId} disconnected! Switching automatically to standby: ${nextSessionId}`);
     setTimeout(() => {
-      startActiveSession(nextSessionId);
+      startActiveSession(nextSessionId, false);
     }, 2000);
   } else {
-    // If no other sessions, retry current active after delay
     setTimeout(() => {
-      startActiveSession(failedSessionId);
+      startActiveSession(failedSessionId, false);
     }, 3000);
   }
 }
 
-// 🚀 1. Send Heartbeat to Live Bridge on Hostinger every 20 seconds
+// 🚀 1. Send Heartbeat to Live Bridge on Hostinger every 15 seconds
 async function syncHeartbeatToBridge() {
   try {
     const allSessions = Array.from(sessionMeta.values()).map(s => {
@@ -383,6 +410,7 @@ async function syncHeartbeatToBridge() {
         is_active: isActive,
         status: isActive ? activeStatus : 'standby',
         qr: isActive ? activeQr : null,
+        pairing_code: isActive ? activePairingCode : null,
       };
     });
 
@@ -391,21 +419,11 @@ async function syncHeartbeatToBridge() {
       active_session_id: currentActiveId,
       phone: activePhone,
       qr: activeQr,
+      pairing_code: activePairingCode,
       sessions: allSessions,
       uptime: process.uptime(),
     };
 
-    // 1. Send to Laravel API bridge
-    await fetch(`${LIVE_BRIDGE_URL}/heartbeat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Bridge-Secret': BRIDGE_SECRET,
-      },
-      body: JSON.stringify(payload),
-    }).catch(() => {});
-
-    // 2. Send to Standalone bridge.php on Hostinger
     await fetch('https://api.lelbai.com/public/bridge.php?action=heartbeat', {
       method: 'POST',
       headers: {
@@ -422,7 +440,7 @@ async function pollAndDispatchBridgeQueue() {
   if (activeStatus !== 'connected' || !activeSock) return;
 
   try {
-    const res = await fetch(`${LIVE_BRIDGE_URL}/pending-queue`, {
+    const res = await fetch(`${LIVE_BRIDGE_URL}?action=pending-queue`, {
       headers: {
         'X-Bridge-Secret': BRIDGE_SECRET,
       },
@@ -445,7 +463,7 @@ async function pollAndDispatchBridgeQueue() {
         console.log(`🚀 [Bridge Dispatch] Sent OTP code ${item.code} to ${formatted}`);
 
         // Mark sent
-        await fetch(`${LIVE_BRIDGE_URL}/mark-sent`, {
+        await fetch(`${LIVE_BRIDGE_URL}?action=mark-sent`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -461,14 +479,12 @@ async function pollAndDispatchBridgeQueue() {
 }
 
 // Start polling & heartbeat intervals
-setInterval(syncHeartbeatToBridge, 20000);
+setInterval(syncHeartbeatToBridge, 15000);
 setInterval(pollAndDispatchBridgeQueue, 3500);
 
-// Start primary session on launch if configured
+// Start primary session on launch
 if (currentActiveId) {
-  startActiveSession(currentActiveId);
-} else {
-  console.log('ℹ️ [WhatsApp Gateway] Ready with 0 active sessions. Add or initialize sessions via Dashboard or API.');
+  startActiveSession(currentActiveId, false);
 }
 
 // -------------------------------------------------------------
@@ -486,6 +502,7 @@ app.get('/status', (req, res) => {
       status: isActive ? activeStatus : 'standby',
       phone: isActive ? activePhone : s.phone,
       qr: isActive ? activeQr : null,
+      pairing_code: isActive ? activePairingCode : null,
       error: isActive ? activeLastError : null,
       messagesReceived: isActive ? activeStats.received : 0,
       messagesSent: isActive ? activeStats.sent : 0,
@@ -497,6 +514,7 @@ app.get('/status', (req, res) => {
     active_session_id: currentActiveId,
     phone: activePhone,
     qr: activeQr,
+    pairing_code: activePairingCode,
     error: activeLastError,
     total_configured_numbers: allSessions.length,
     sessions: allSessions,
@@ -512,6 +530,7 @@ app.get('/sessions', (req, res) => {
     status: s.id === currentActiveId ? activeStatus : 'standby',
     phone: s.id === currentActiveId ? activePhone : s.phone,
     qr: s.id === currentActiveId ? activeQr : null,
+    pairing_code: s.id === currentActiveId ? activePairingCode : null,
   }));
 
   return res.json({
@@ -541,8 +560,7 @@ app.post('/sessions/create', async (req, res) => {
       isStandby: existingIds.length > 0
     });
 
-    // Switch active monitoring to this new session so user can scan its QR code
-    startActiveSession(newId);
+    startActiveSession(newId, false);
 
     return res.json({
       success: true,
@@ -555,35 +573,154 @@ app.post('/sessions/create', async (req, res) => {
   }
 });
 
-// API 4: Switch Active Monitored Session
+// API 4: Request 8-Digit Pairing Code for Active Session
+app.post('/sessions/:id/pairing-code', async (req, res) => {
+  const { id } = req.params;
+  const { phone } = req.body;
+
+  if (!phone) {
+    return res.status(400).json({ success: false, message: 'رقم الهاتف مطلوب لتوليد كود الربط.' });
+  }
+
+  const formatted = formatWhatsAppPhone(phone);
+  if (!formatted) {
+    return res.status(422).json({
+      success: false,
+      message: 'رقم الهاتف غير صالح. يرجى إدخال رقم صحيح (مثال: 0912345678 أو 0512345678 أو 963912345678).'
+    });
+  }
+
+  if (currentActiveId !== id || !activeSock) {
+    await startActiveSession(id, false);
+    await new Promise(r => setTimeout(r, 1200));
+  }
+
+  if (activeStatus === 'connected') {
+    return res.json({
+      success: true,
+      already_connected: true,
+      message: `الحساب متصل بالفعل برقم +${activePhone}`,
+      phone: activePhone,
+    });
+  }
+
+  try {
+    console.log(`📲 [Pairing Code Request] Requesting pairing code for +${formatted}...`);
+    const rawCode = await activeSock.requestPairingCode(formatted);
+    // Format nicely as ABCD-EFGH
+    const code = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+    activePairingCode = code;
+    console.log(`🔑 [Pairing Code Generated] +${formatted} => ${code}`);
+
+    syncHeartbeatToBridge();
+
+    return res.json({
+      success: true,
+      pairing_code: code,
+      raw_code: rawCode,
+      phone: formatted,
+      message: `تم توليد رمز الربط بنجاح: ${code}`,
+      instructions: [
+        '1. افتح تطبيق واتساب على هاتفك 📱',
+        '2. اضغط على خيارات (الثلاث نقاط) ➡️ الأجهزة المرتبطة',
+        '3. اضغط على "ربط جهاز" ➡️ ثم اضغط على "الربط برقم الهاتف بدلاً من ذلك"',
+        `4. أدخل هذا الرمز: ${code}`
+      ]
+    });
+  } catch (err) {
+    console.error('Error requesting pairing code:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'فشل توليد رمز الربط: ' + err.message
+    });
+  }
+});
+
+// Shortcut for pairing code without session ID
+app.post('/pairing-code', async (req, res) => {
+  const sessionId = currentActiveId || 'session_1';
+  req.url = `/sessions/${sessionId}/pairing-code`;
+  req.params = { id: sessionId };
+  const { phone } = req.body;
+
+  if (!phone) {
+    return res.status(400).json({ success: false, message: 'رقم الهاتف مطلوب لتوليد كود الربط.' });
+  }
+
+  const formatted = formatWhatsAppPhone(phone);
+  if (!formatted) {
+    return res.status(422).json({
+      success: false,
+      message: 'رقم الهاتف غير صالح. يرجى إدخال رقم صحيح (مثال: 0912345678 أو 0512345678 أو 963912345678).'
+    });
+  }
+
+  if (!activeSock) {
+    await startActiveSession(sessionId, false);
+    await new Promise(r => setTimeout(r, 1200));
+  }
+
+  if (activeStatus === 'connected') {
+    return res.json({
+      success: true,
+      already_connected: true,
+      message: `الحساب متصل بالفعل برقم +${activePhone}`,
+      phone: activePhone,
+    });
+  }
+
+  try {
+    const rawCode = await activeSock.requestPairingCode(formatted);
+    const code = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+    activePairingCode = code;
+    syncHeartbeatToBridge();
+
+    return res.json({
+      success: true,
+      pairing_code: code,
+      raw_code: rawCode,
+      phone: formatted,
+      message: `تم توليد رمز الربط بنجاح: ${code}`,
+      instructions: [
+        '1. افتح تطبيق واتساب على هاتفك 📱',
+        '2. اضغط على خيارات (الثلاث نقاط) ➡️ الأجهزة المرتبطة',
+        '3. اضغط على "ربط جهاز" ➡️ ثم اضغط على "الربط برقم الهاتف بدلاً من ذلك"',
+        `4. أدخل هذا الرمز: ${code}`
+      ]
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'فشل توليد رمز الربط: ' + err.message });
+  }
+});
+
+// API 5: Switch Active Monitored Session
 app.post('/sessions/:id/activate', async (req, res) => {
   const { id } = req.params;
   if (!sessionMeta.has(id)) {
     return res.status(404).json({ success: false, message: 'الحساب غير موجود.' });
   }
 
-  startActiveSession(id);
+  startActiveSession(id, false);
   return res.json({
     success: true,
     message: `تم تعيين (${sessionMeta.get(id).name}) كرقم فعّال يتم مراقبته الآن.`,
   });
 });
 
-// API 5: Restart Active Session
+// API 6: Restart Active Session
 app.post('/sessions/:id/restart', async (req, res) => {
   const { id } = req.params;
-  startActiveSession(id);
+  startActiveSession(id, false);
   return res.json({ success: true, message: 'تمت إعادة تشغيل الجلسة بنجاح.' });
 });
 
-// API 6: Delete Session (Completely remove and wipe)
+// API 7: Delete Session (Completely remove and wipe)
 app.delete('/sessions/:id', async (req, res) => {
   const { id } = req.params;
   if (!sessionMeta.has(id)) {
     return res.status(404).json({ success: false, message: 'الحساب غير موجود.' });
   }
 
-  // 1. Close socket if currently running this session
   if (currentActiveId === id && activeSock) {
     try {
       activeSock.ev.removeAllListeners('connection.update');
@@ -594,7 +731,6 @@ app.delete('/sessions/:id', async (req, res) => {
     activeSock = null;
   }
 
-  // 2. Remove folder from disk
   const sessionFolder = path.join(SESSIONS_DIR, id);
   if (fs.existsSync(sessionFolder)) {
     try {
@@ -604,25 +740,23 @@ app.delete('/sessions/:id', async (req, res) => {
     }
   }
 
-  // 3. Remove from sessionMeta
   sessionMeta.delete(id);
 
-  // 4. Handle active session reassignment
   if (currentActiveId === id) {
     activePhone = null;
     activeQr = null;
+    activePairingCode = null;
     activeLastError = null;
     const remaining = Array.from(sessionMeta.keys());
     if (remaining.length > 0) {
       currentActiveId = remaining[0];
-      startActiveSession(currentActiveId);
+      startActiveSession(currentActiveId, false);
     } else {
       currentActiveId = null;
       activeStatus = 'disconnected';
     }
   }
 
-  // 5. Notify bridge of updated status
   syncHeartbeatToBridge();
 
   return res.json({
@@ -632,7 +766,7 @@ app.delete('/sessions/:id', async (req, res) => {
   });
 });
 
-// API 6.1: Logout Session without Deleting Configuration
+// API 8: Logout Session
 app.post('/sessions/:id/logout', async (req, res) => {
   const { id } = req.params;
   if (!sessionMeta.has(id)) {
@@ -666,6 +800,7 @@ app.post('/sessions/:id/logout', async (req, res) => {
   if (currentActiveId === id) {
     activePhone = null;
     activeQr = null;
+    activePairingCode = null;
     activeStatus = 'disconnected';
   }
 
@@ -676,7 +811,6 @@ app.post('/sessions/:id/logout', async (req, res) => {
 
 app.post('/logout', async (req, res) => {
   if (currentActiveId) {
-    req.params = { id: currentActiveId };
     if (activeSock) {
       try {
         await activeSock.logout().catch(() => {});
@@ -690,13 +824,14 @@ app.post('/logout', async (req, res) => {
     }
     activePhone = null;
     activeQr = null;
+    activePairingCode = null;
     activeStatus = 'disconnected';
     syncHeartbeatToBridge();
   }
   return res.json({ success: true, message: 'تم تسجيل الخروج بنجاح.' });
 });
 
-// API 7: Check Number on WhatsApp
+// API 9: Check Number on WhatsApp
 app.post('/check-number', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.status(400).json({ exists: false, message: 'رقم الهاتف مطلوب.' });
@@ -731,7 +866,7 @@ app.post('/check-number', async (req, res) => {
   }
 });
 
-// API 8: Send OTP via Active Number
+// API 10: Send OTP via Active Number
 app.post('/send-otp', async (req, res) => {
   const { phone, code } = req.body;
   if (!phone || !code) return res.status(400).json({ message: 'رقم الجوال ورمز التحقق مطلوبان.' });
@@ -759,7 +894,7 @@ app.post('/send-otp', async (req, res) => {
   }
 });
 
-// Web UI: Dashboard with Live QR Code & Session Monitor
+// Web Dashboard
 app.get('/', (req, res) => {
   const isConnected = activeStatus === 'connected';
   const isQrReady = activeStatus === 'qr_ready' && activeQr;
@@ -788,8 +923,8 @@ app.get('/', (req, res) => {
       border-radius: 16px;
       padding: 32px;
       width: 100%;
-      max-width: 480px;
-      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+      max-width: 500px;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
       text-align: center;
       border: 1px solid #334155;
     }
@@ -814,9 +949,9 @@ app.get('/', (req, res) => {
       padding: 16px;
       border-radius: 12px;
       display: inline-block;
-      margin-bottom: 20px;
+      margin-bottom: 16px;
     }
-    .qr-container img { display: block; width: 220px; height: 220px; }
+    .qr-container img { display: block; width: 200px; height: 200px; }
     .info-box {
       background: #0f172a;
       border: 1px solid #334155;
@@ -843,32 +978,27 @@ app.get('/', (req, res) => {
     }
     .btn:hover { background: #1d4ed8; }
   </style>
-  <script>
-    setTimeout(() => {
-      window.location.reload();
-    }, 6000);
-  </script>
 </head>
 <body>
   <div class="card">
     <div class="badge ${isConnected ? 'badge-connected' : isQrReady ? 'badge-qr' : 'badge-disconnected'}">
       <span class="dot"></span>
-      ${isConnected ? 'متصل وجاهز للعمل' : isQrReady ? 'بانتظار مسح رمز QR' : 'جاري تهيئة الاتصال...'}
+      ${isConnected ? 'متصل وجاهز للعمل' : isQrReady ? 'بانتظار الربط (QR أو رمز الهاتف)' : 'جاري تهيئة الاتصال...'}
     </div>
     
     <h1>بوابة واتساب منصة للبيع</h1>
-    <p>امسح الرمز من تطبيق واتساب لربط رقم الهاتف تلقائياً</p>
+    <p>امسح الرمز من تطبيق واتساب أو اطلب كود الربط المباشر 📱</p>
 
-    ${isQrReady ? `
+    ${isConnected ? `
+      <div style="font-size: 48px; margin-bottom: 16px;">✅</div>
+      <p style="color: #34d399; font-weight: bold; font-size: 18px;">الرقم المتصل: +${activePhone}</p>
+    ` : isQrReady ? `
       <div class="qr-container">
         <img src="${activeQr}" alt="QR Code" />
       </div>
-      <p style="font-size: 12px; color: #64748b; margin-top: -10px;">يتجدد الرمز تلقائياً كل 6 ثوانٍ</p>
-    ` : isConnected ? `
-      <div style="font-size: 48px; margin-bottom: 16px;">✅</div>
-      <p style="color: #34d399; font-weight: bold; font-size: 16px;">الرقم المتصل: +${activePhone}</p>
+      <div style="font-size: 12px; color: #94a3b8; margin-bottom: 16px;">امسح الكود من: واتساب ⬅️ الأجهزة المرتبطة ⬅️ ربط جهاز</div>
     ` : `
-      <div style="padding: 40px; color: #94a3b8;">جاري توليد رمز QR... يرجى الانتظار</div>
+      <div style="padding: 40px; color: #94a3b8;">جاري توليد الباركود... يرجى الانتظار</div>
     `}
 
     <div class="info-box">
@@ -885,7 +1015,7 @@ app.get('/', (req, res) => {
   return res.send(html);
 });
 
-// API 9: Health check
+// API 11: Health check
 app.get('/health', (req, res) => {
   return res.json({
     status: 'ok',
@@ -899,5 +1029,5 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 WhatsApp Active-Standby Gateway running on port ${PORT}`);
-  console.log(`🔗 Connected with Live Bridge: ${LIVE_BRIDGE_URL}`);
+  console.log(`🔗 Connected with Live Bridge: https://api.lelbai.com/public/bridge.php`);
 });
