@@ -95,9 +95,8 @@ function loadSessionsFromDisk() {
     const entries = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true });
     const sessionDirs = entries.filter(e => e.isDirectory()).map(e => e.name);
 
-    if (sessionDirs.length === 0) {
-      sessionMeta.set('session_1', { id: 'session_1', name: 'الرقم الأساسي (1)', phone: null, isStandby: false });
-    } else {
+    sessionMeta.clear();
+    if (sessionDirs.length > 0) {
       sessionDirs.forEach((dir, idx) => {
         sessionMeta.set(dir, {
           id: dir,
@@ -106,9 +105,15 @@ function loadSessionsFromDisk() {
           isStandby: idx !== 0,
         });
       });
+      currentActiveId = sessionDirs[0];
+    } else {
+      currentActiveId = null;
+      activeStatus = 'disconnected';
     }
   } catch (e) {
-    sessionMeta.set('session_1', { id: 'session_1', name: 'الرقم الأساسي (1)', phone: null, isStandby: false });
+    sessionMeta.clear();
+    currentActiveId = null;
+    activeStatus = 'disconnected';
   }
 }
 
@@ -118,6 +123,23 @@ loadSessionsFromDisk();
  * Start monitoring and running ONLY the single active session
  */
 async function startActiveSession(sessionId) {
+  if (!sessionId) {
+    if (activeSock) {
+      try {
+        activeSock.ev.removeAllListeners('connection.update');
+        activeSock.ev.removeAllListeners('creds.update');
+        activeSock.ev.removeAllListeners('messages.upsert');
+        activeSock.end();
+      } catch (e) {}
+      activeSock = null;
+    }
+    currentActiveId = null;
+    activeStatus = 'disconnected';
+    activePhone = null;
+    activeQr = null;
+    return;
+  }
+
   currentActiveId = sessionId;
   const sessionFolder = path.join(SESSIONS_DIR, sessionId);
   if (!fs.existsSync(sessionFolder)) {
@@ -272,12 +294,34 @@ async function startActiveSession(sessionId) {
             }
           } catch (e) {}
           activePhone = null;
+          const meta = sessionMeta.get(sessionId);
+          if (meta) {
+            meta.phone = null;
+            sessionMeta.set(sessionId, meta);
+          }
         }
 
         syncHeartbeatToBridge();
 
-        // Automatic Failover: If active number failed/disconnected, switch to next standby session
-        handleFailoverToNextSession(sessionId, isLoggedOut);
+        // Automatic Failover:
+        if (!isLoggedOut) {
+          handleFailoverToNextSession(sessionId, false);
+        } else {
+          // If logged out on phone, check if there is another standby session
+          const allIds = Array.from(sessionMeta.keys());
+          const otherIds = allIds.filter(id => id !== sessionId);
+          if (otherIds.length > 0) {
+            console.log(`⚡ [Logged Out] Session ${sessionId} logged out on device. Switching to standby: ${otherIds[0]}`);
+            setTimeout(() => {
+              startActiveSession(otherIds[0]);
+            }, 2000);
+          } else {
+            console.log(`ℹ️ [Logged Out] Session ${sessionId} logged out on device. Clean state ready.`);
+            setTimeout(() => {
+              startActiveSession(sessionId);
+            }, 2000);
+          }
+        }
       }
     });
 
@@ -385,8 +429,12 @@ async function pollAndDispatchBridgeQueue() {
 setInterval(syncHeartbeatToBridge, 20000);
 setInterval(pollAndDispatchBridgeQueue, 3500);
 
-// Start primary session on launch
-startActiveSession(currentActiveId);
+// Start primary session on launch if configured
+if (currentActiveId) {
+  startActiveSession(currentActiveId);
+} else {
+  console.log('ℹ️ [WhatsApp Gateway] Ready with 0 active sessions. Add or initialize sessions via Dashboard or API.');
+}
 
 // -------------------------------------------------------------
 // API Endpoints
@@ -450,8 +498,13 @@ app.post('/sessions/create', async (req, res) => {
       newId = `session_${nextNum}`;
     }
 
-    const sessionName = customName || `الرقم الاحتياطي #${nextNum}`;
-    sessionMeta.set(newId, { id: newId, name: sessionName, phone: null, isStandby: true });
+    const sessionName = customName || (existingIds.length === 0 ? 'الرقم الأساسي (1)' : `الرقم الاحتياطي #${nextNum}`);
+    sessionMeta.set(newId, {
+      id: newId,
+      name: sessionName,
+      phone: null,
+      isStandby: existingIds.length > 0
+    });
 
     // Switch active monitoring to this new session so user can scan its QR code
     startActiveSession(newId);
@@ -488,11 +541,78 @@ app.post('/sessions/:id/restart', async (req, res) => {
   return res.json({ success: true, message: 'تمت إعادة تشغيل الجلسة بنجاح.' });
 });
 
-// API 6: Delete Session
+// API 6: Delete Session (Completely remove and wipe)
 app.delete('/sessions/:id', async (req, res) => {
   const { id } = req.params;
   if (!sessionMeta.has(id)) {
     return res.status(404).json({ success: false, message: 'الحساب غير موجود.' });
+  }
+
+  // 1. Close socket if currently running this session
+  if (currentActiveId === id && activeSock) {
+    try {
+      activeSock.ev.removeAllListeners('connection.update');
+      activeSock.ev.removeAllListeners('creds.update');
+      activeSock.ev.removeAllListeners('messages.upsert');
+      activeSock.end();
+    } catch (e) {}
+    activeSock = null;
+  }
+
+  // 2. Remove folder from disk
+  const sessionFolder = path.join(SESSIONS_DIR, id);
+  if (fs.existsSync(sessionFolder)) {
+    try {
+      fs.rmSync(sessionFolder, { recursive: true, force: true });
+    } catch (e) {
+      console.error(`Error deleting session folder ${id}:`, e.message);
+    }
+  }
+
+  // 3. Remove from sessionMeta
+  sessionMeta.delete(id);
+
+  // 4. Handle active session reassignment
+  if (currentActiveId === id) {
+    activePhone = null;
+    activeQr = null;
+    activeLastError = null;
+    const remaining = Array.from(sessionMeta.keys());
+    if (remaining.length > 0) {
+      currentActiveId = remaining[0];
+      startActiveSession(currentActiveId);
+    } else {
+      currentActiveId = null;
+      activeStatus = 'disconnected';
+    }
+  }
+
+  // 5. Notify bridge of updated status
+  syncHeartbeatToBridge();
+
+  return res.json({
+    success: true,
+    message: 'تم حذف الحساب والجلسة بنجاح.',
+    remaining_sessions: sessionMeta.size
+  });
+});
+
+// API 6.1: Logout Session without Deleting Configuration
+app.post('/sessions/:id/logout', async (req, res) => {
+  const { id } = req.params;
+  if (!sessionMeta.has(id)) {
+    return res.status(404).json({ success: false, message: 'الحساب غير موجود.' });
+  }
+
+  if (currentActiveId === id && activeSock) {
+    try {
+      await activeSock.logout().catch(() => {});
+      activeSock.ev.removeAllListeners('connection.update');
+      activeSock.ev.removeAllListeners('creds.update');
+      activeSock.ev.removeAllListeners('messages.upsert');
+      activeSock.end();
+    } catch (e) {}
+    activeSock = null;
   }
 
   const sessionFolder = path.join(SESSIONS_DIR, id);
@@ -502,18 +622,43 @@ app.delete('/sessions/:id', async (req, res) => {
     } catch (e) {}
   }
 
-  sessionMeta.delete(id);
-
-  if (sessionMeta.size === 0) {
-    sessionMeta.set('session_1', { id: 'session_1', name: 'الرقم الأساسي (1)', phone: null, isStandby: false });
+  const meta = sessionMeta.get(id);
+  if (meta) {
+    meta.phone = null;
+    sessionMeta.set(id, meta);
   }
 
-  const remaining = Array.from(sessionMeta.keys());
   if (currentActiveId === id) {
-    startActiveSession(remaining[0]);
+    activePhone = null;
+    activeQr = null;
+    activeStatus = 'disconnected';
   }
 
-  return res.json({ success: true, message: 'تم حذف الحساب بنجاح.' });
+  syncHeartbeatToBridge();
+
+  return res.json({ success: true, message: 'تم تسجيل الخروج وفصل الحساب بنجاح.' });
+});
+
+app.post('/logout', async (req, res) => {
+  if (currentActiveId) {
+    req.params = { id: currentActiveId };
+    if (activeSock) {
+      try {
+        await activeSock.logout().catch(() => {});
+        activeSock.end();
+      } catch (e) {}
+      activeSock = null;
+    }
+    const sessionFolder = path.join(SESSIONS_DIR, currentActiveId);
+    if (fs.existsSync(sessionFolder)) {
+      try { fs.rmSync(sessionFolder, { recursive: true, force: true }); } catch (e) {}
+    }
+    activePhone = null;
+    activeQr = null;
+    activeStatus = 'disconnected';
+    syncHeartbeatToBridge();
+  }
+  return res.json({ success: true, message: 'تم تسجيل الخروج بنجاح.' });
 });
 
 // API 7: Check Number on WhatsApp
