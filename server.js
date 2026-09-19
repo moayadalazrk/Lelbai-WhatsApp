@@ -355,29 +355,48 @@ function handleFailoverToNextSession(failedSessionId, isLoggedOut) {
   }
 }
 
-// 🚀 1. Send Heartbeat to Live Bridge every 20 seconds
+// 🚀 1. Send Heartbeat to Live Bridge on Hostinger every 20 seconds
 async function syncHeartbeatToBridge() {
   try {
-    const allSessions = Array.from(sessionMeta.values()).map(s => ({
-      id: s.id,
-      name: s.name,
-      phone: s.id === currentActiveId ? activePhone : s.phone,
-      is_active: s.id === currentActiveId,
-      status: s.id === currentActiveId ? activeStatus : 'standby',
-    }));
+    const allSessions = Array.from(sessionMeta.values()).map(s => {
+      const isActive = s.id === currentActiveId;
+      return {
+        id: s.id,
+        name: s.name,
+        phone: isActive ? activePhone : s.phone,
+        is_active: isActive,
+        status: isActive ? activeStatus : 'standby',
+        qr: isActive ? activeQr : null,
+      };
+    });
 
+    const payload = {
+      status: activeStatus,
+      active_session_id: currentActiveId,
+      phone: activePhone,
+      qr: activeQr,
+      sessions: allSessions,
+      uptime: process.uptime(),
+    };
+
+    // 1. Send to Laravel API bridge
     await fetch(`${LIVE_BRIDGE_URL}/heartbeat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Bridge-Secret': BRIDGE_SECRET,
       },
-      body: JSON.stringify({
-        status: activeStatus,
-        phone: activePhone,
-        sessions: allSessions,
-        uptime: process.uptime(),
-      }),
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+
+    // 2. Send to Standalone bridge.php on Hostinger
+    await fetch('https://api.lelbai.com/public/bridge.php?action=heartbeat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Bridge-Secret': BRIDGE_SECRET,
+      },
+      body: JSON.stringify(payload),
     }).catch(() => {});
   } catch (err) {}
 }
